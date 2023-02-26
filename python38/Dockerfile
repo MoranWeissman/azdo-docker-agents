@@ -1,5 +1,5 @@
 # Start from the latest version of the Azure DevOps agent image
-FROM 704909879244.dkr.ecr.eu-west-1.amazonaws.com/azure-devops-agent-generic:0.0.1
+FROM 111111111111.dkr.ecr.eu-west-1.amazonaws.com/azure-devops-agent-generic:0.0.1
 
 # Install Python 3.8 and the necessary dependencies
 RUN apt-get update && \

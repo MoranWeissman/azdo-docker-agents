@@ -1,0 +1,5 @@
+variables:     
+  dockerBaseImageName: 'azure-devops-agent-generic'
+  awsAccountId: '704909879244'
+  commitMessage: 'Upgrade agent to version'
+  awsRegion: eu-west-1

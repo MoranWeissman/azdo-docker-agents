@@ -1,0 +1,199 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+
+parameters:
+  - name: buildAgentSpecificFramework
+    type: string
+    displayName: 'Choose which framework agent you need:'
+    default: 'generic'
+    values:      
+      - 'generic'
+      - 'python38'
+
+resources:
+  repositories:
+    - repository: Helm
+      type: git
+      name: azdo-agents-gitops
+
+jobs:
+  - job: buildDockerImage
+    displayName: 'Build azdo docker image'
+
+    workspace:
+      clean: all
+
+    variables:
+      - group: aws-ecr-credentials
+      - template: .azure-pipeline/azure-pipeline-variables.yaml
+      - name: dockerImageName
+        value: 'azure-devops-agent-${{ parameters.buildAgentSpecificFramework }}'   
+
+    steps:      
+      - checkout: self      
+        persistCredentials: true
+        clean: true
+
+      - checkout: Helm          
+        persistCredentials: true
+        clean: true
+
+      # Authenticate with AWS ECR
+      - task: Bash@3
+        displayName: 'Login to AWS'
+        continueOnError: false
+        inputs:
+          targetType: 'inline'
+          script: |
+            aws ecr get-login-password --region $(awsRegion) | docker login --username AWS --password-stdin "$(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com"
+        env:
+          AWS_ACCESS_KEY_ID: $(accessKey)
+          AWS_SECRET_ACCESS_KEY: $(secretAccessKey)        
+
+      # Bump the version of the Docker image
+      - task: Bash@3
+        displayName: 'Bump agent version'
+        condition: succeeded()
+        continueOnError: false
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -x
+            
+            get_version() {
+            local dir="$1"
+            
+            if [ -d "$dir" ]; then
+              local version_file="$dir/VERSION"
+              cat "$version_file"
+            else
+              echo "Error: Directory $dir not found"
+              exit 1
+            fi
+            }
+
+            # Download and install the semver-tool binary            
+            wget -O /usr/local/bin/semver \
+            https://raw.githubusercontent.com/fsaintjacques/semver-tool/master/src/semver && \
+            chmod +x /usr/local/bin/semver
+
+            # Determine the path to the version file
+            if [ "${{ parameters.buildAgentSpecificFramework }}" = "generic" ]; then
+              versionFilePath="$(Build.SourcesDirectory)/azdo-docker-agents"
+            else              
+              versionFilePath="$(Build.SourcesDirectory)/azdo-docker-agents/${{ parameters.buildAgentSpecificFramework }}"
+            fi
+            
+            # Get the current version from the version file
+            version=$(get_version "$versionFilePath")
+          
+            # Use semver-tool to increment the patch version number in the current version
+            new_version="$(semver bump patch $version)"
+
+            # Set the new version as a pipeline variable
+            echo "##vso[task.setvariable variable=version]$new_version"
+
+      # Build and push the Docker image            
+      - task: Bash@3
+        displayName: 'Build and push Docker image'
+        condition: succeeded()
+        continueOnError: false
+        inputs:
+          targetType: 'inline'
+          script: |
+            #!/bin/bash 
+            set -x
+            
+            # Determine the path to the Dockerfile
+            if [ "${{ parameters.buildAgentSpecificFramework }}" = "generic" ]; then
+              dockerfilePath="$(Build.SourcesDirectory)/azdo-docker-agents"
+            else              
+              dockerfilePath="$(Build.SourcesDirectory)/azdo-docker-agents/${{ parameters.buildAgentSpecificFramework }}"
+            fi
+                      
+            # Build the Docker image and push it to ECR
+            cd $dockerfilePath
+            docker build -t $(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(dockerImageName):"$(version)" . && \
+            docker push "$(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(dockerImageName):$(version)"
+
+            # Set a variable indicating the success or failure of the docker push
+            dockerPushStatus=$(echo $?)
+
+            if [ $dockerPushStatus = 1 ]; then
+              echo "Docker push has failed"  
+              exit 0
+            fi
+
+            echo -n "$(version)" > VERSION
+            echo "##vso[task.setvariable variable=dockerPushStatus]$dockerPushStatus"
+
+      - task: Bash@3
+        displayName: 'Push Docker version to code'
+        condition: and(succeeded(), eq(variables['dockerPushStatus'], '0'))
+        continueOnError: false
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -x
+
+            cd $(Build.SourcesDirectory)/azdo-docker-agents
+            ls -l
+
+            git config --global user.email $BUILD_REQUESTEDFOREMAIL
+            git config --global user.name "$BUILD_QUEUEDBY"            
+            git add .
+            git commit -m "[$(Build.Repository.Name)][$(Build.SourceVersion)]"
+            git push origin HEAD:main --force
+
+      - task: Bash@3
+        displayName: 'Update FROM version in Dockerfiles'
+        condition: and(succeeded(), eq('${{ parameters.buildAgentSpecificFramework }}', 'generic'))
+        continueOnError: false
+        inputs:
+          targetType: 'inline'
+          script: |
+            #!/bin/bash              
+            set -x
+
+            # Define the ECR repository URL
+            ecr_repo="$(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(dockerBaseImageName)"
+
+            # Search for all folders containing a Dockerfile
+            cd $(Build.SourcesDirectory)/azdo-docker-agents
+            for folder in $(find . -name "Dockerfile" -exec dirname {} \; | sort -u); do
+              # Get the current tag from the FROM line in each Dockerfile
+              current_tag=$(grep -oP '(?<=FROM ).*:[^ ]+' "$folder/Dockerfile" | awk -F':' '{print $2}')
+              if [ -n "$current_tag" ]; then
+                # Update the FROM line in each Dockerfile with the new tag
+                sed -i "s|FROM $ecr_repo:$current_tag|FROM $ecr_repo:$(version)|g" "$folder/Dockerfile"
+              fi
+            done
+
+            # Configure Git credentials and commit the changes to the Dockerfiles
+            git config --global user.email $BUILD_REQUESTEDFOREMAIL
+            git config --global user.name "$BUILD_QUEUEDBY"
+            git add .
+            git commit -am "$(commitMessage) $(version)"
+            git push origin HEAD:main --force             
+
+      - task: Bash@3
+        displayName: 'Update Helm chart and push changes to Git'
+        inputs:
+          targetType: 'inline'
+          script: |
+            # Determine the path to the Helm chart directory and get the relevant version            
+            helmChartDir="$(Build.SourcesDirectory)/azdo-agents-gitops/azure-devops-agent-${{ parameters.buildAgentSpecificFramework }}"
+            
+            # Replace the tag version in the Helm chart's values.yaml file with the new version number
+            valuesFile="$helmChartDir/values.yaml"
+            helmChartversion=$(cat "$valuesFile" | grep tag: | awk '{print $2}')          
+            sed -i "s/tag: $helmChartversion/tag: $(version)/" "$valuesFile"
+
+            # Configure Git credentials and commit the changes to the Helm chart directory
+            cd $(Build.SourcesDirectory)/azdo-agents-gitops
+            git config --global user.email "you@example.com"
+            git config --global user.name "ArgoCD GitOps"
+            git add .
+            git commit -m "$(commitMessage) $(version)"
+            git push origin HEAD:main --force

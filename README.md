@@ -1,6 +1,17 @@
 ## Azure DevOps Agent Docker Image
 
 This repository contains a Dockerfile for building an Azure DevOps agent image that can be deployed to a Kubernetes cluster as a pod.
+It also contains a pipeline to build and deploy the Agents Docker images to ECR.
+
+It's worth noting that I modified the original Dockerfile and startup script to add more tools that didn't exist and the ability to pass a custom capability to the Agent when created. 
+
+To make it easier, I organized the files and folders needed for you to have everything required.
+For instance, I’ve created a directory named python38 that represents an Azure DevOps Docker Agent Docker image for Python 3.8, which can be helpful when moving Python-based CI pipelines and automation tests to Kubernetes.
+This just one example.
+
+My solution uses a different Docker image for each framework I need for my CI pipelines.
+We can always add more for frameworks like Java, Dotnet, and Robot Framework, among others. Each framework will contain a Dockerfile that will be based on the generic Docker image that is built using the pipeline, and will include all the SDK and tools that it needs to compile or test the code.
+
 
 ### Prerequisites
 
